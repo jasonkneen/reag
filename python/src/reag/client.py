@@ -1,7 +1,7 @@
 import httpx
 import asyncio
 import json
-
+import re
 from typing import List, Optional, TypeVar, Dict, Union
 from pydantic import BaseModel
 from litellm import acompletion
@@ -43,12 +43,14 @@ class ReagClient:
         system: str = None,
         batch_size: int = DEFAULT_BATCH_SIZE,
         schema: Optional[BaseModel] = None,
+        model_kwargs: Optional[Dict] = None,
     ):
         self.model = model
         self.filtration_model = filtration_model
         self.system = system or REAG_SYSTEM_PROMPT
         self.batch_size = batch_size
         self.schema = schema or ResponseSchemaMessage
+        self.model_kwargs = model_kwargs or {}
         self._http_client = None
 
     async def __aenter__(self):
@@ -129,6 +131,31 @@ class ReagClient:
 
         return filtered_docs
 
+    def _extract_think_content(self, text: str) -> tuple[str, str, bool]:
+        """Extract content from think tags and parse the bulleted response format."""
+        # Extract think content
+        think_match = re.search(r'<think>(.*?)</think>', text, flags=re.DOTALL)
+        reasoning = think_match.group(1).strip() if think_match else ""
+        
+        # Remove think tags and get remaining text
+        remaining_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+        
+        # Initialize default values
+        content = ""
+        is_irrelevant = True
+        
+        # Extract is_irrelevant value
+        irrelevant_match = re.search(r'\*\*isIrrelevant:\*\*\s*(true|false)', remaining_text, re.IGNORECASE)
+        if irrelevant_match:
+            is_irrelevant = irrelevant_match.group(1).lower() == 'true'
+        
+        # Extract content value
+        content_match = re.search(r'\*\*Answer:\*\*\s*(.*?)(?:\n|$)', remaining_text, re.DOTALL)
+        if content_match:
+            content = content_match.group(1).strip()
+        
+        return content, reasoning, is_irrelevant
+
     async def query(
         self, prompt: str, documents: List[Document], options: Optional[Dict] = None
     ) -> List[QueryResult]:
@@ -158,9 +185,20 @@ class ReagClient:
 
             results = []
             for batch in batches:
+                tasks = []
+                # Create tasks for parallel processing within the batch
                 for document in batch:
-                    system = (
-                        f"{self.system}\n\n# Available source\n\n{format_doc(document)}"
+                    system = f"{self.system}\n\n# Available source\n\n{format_doc(document)}"
+                    tasks.append(
+                        acompletion(
+                            model=self.model,
+                            messages=[
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": prompt},
+                            ],
+                            response_format=self.schema,
+                            **self.model_kwargs,
+                        )
                     )
 
                     # Use litellm for model completion with the filtration model
@@ -217,10 +255,10 @@ class ReagClient:
                                 ),
                                 document=document,
                             )
-                        )
                     except json.JSONDecodeError:
                         print("Error: Could not parse response:", filtration_message_content)
                         continue  # Skip this iteration if parsing fails
+
 
             return results
 
